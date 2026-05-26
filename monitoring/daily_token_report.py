@@ -1,34 +1,44 @@
 #!/usr/bin/env python3
-"""Daily token cost report — reads hourly CSV, zero log parsing.
+"""Daily token cost report with GLM-5.1 summarization.
 
 Designed for Hermes cron (no_agent=True). Runs daily at 12:00.
 
-Data flow:
-  hourly CSV → aggregate → daily summary text → daily CSV row
+Pipeline:
+  1. Read hourly CSV → aggregate costs
+  2. Read archived daily log → extract user messages
+  3. Call GLM-5.1 API once → generate quality daily summary
+  4. Save summary to daily CSV
+  5. Print full report with summary (delivered to Telegram)
 
-NO raw log parsing — everything comes from the hourly CSV
-that token_report_cron.py already wrote.
+Cost: ~¥0.05/day for the one 5.1 API call.
 """
 
 import csv
+import json
 import sys
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
 DATA_DIR = Path.home() / ".hermes" / "data"
 HOURLY_CSV = DATA_DIR / "hourly_token_costs.csv"
 DAILY_CSV = DATA_DIR / "daily_token_costs.csv"
+LOGS_ARCHIVE_DIR = DATA_DIR / "logs"
+
+# GLM API config (from Hermes auth.json)
+AUTH_PATH = Path.home() / ".hermes" / "auth.json"
+API_BASE_URL = "https://open.bigmodel.cn/api/coding/paas/v4"
+MODEL = "glm-5.1"
 
 DAILY_HEADERS = [
     "date", "total_cost", "messages", "api_calls",
     "tokens_in", "tokens_out", "tokens_cached", "cache_rate",
     "hours_active", "peak_hour", "peak_hour_cost",
-    "avg_per_msg", "top_topics",
+    "avg_per_msg", "summary",
 ]
 
 
 def load_csv(path):
-    """Load CSV rows as list of dicts."""
     if not path.exists():
         return []
     with open(path, "r", newline="") as f:
@@ -36,7 +46,6 @@ def load_csv(path):
 
 
 def save_csv(path, rows, headers):
-    """Save rows to CSV."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=headers)
@@ -44,10 +53,21 @@ def save_csv(path, rows, headers):
         writer.writerows(rows)
 
 
-def aggregate_day(hourly_rows, today_str):
-    """Aggregate hourly rows into a daily summary."""
-    day_rows = [r for r in hourly_rows if r.get("date") == today_str]
+def get_api_key():
+    """Read GLM API key from Hermes auth.json."""
+    with open(AUTH_PATH) as f:
+        auth = json.load(f)
+    for provider, creds in auth.get("credential_pool", {}).items():
+        for c in creds:
+            token = c.get("access_token", "")
+            if token:
+                return token
+    return None
 
+
+def aggregate_day(hourly_rows, today_str):
+    """Aggregate hourly rows into daily cost stats."""
+    day_rows = [r for r in hourly_rows if r.get("date") == today_str]
     if not day_rows:
         return None
 
@@ -60,30 +80,8 @@ def aggregate_day(hourly_rows, today_str):
     hours_active = len(day_rows)
 
     cache_rate = f"{total_cached / total_in * 100:.0f}" if total_in else "0"
-
-    # Find peak hour
     peak_row = max(day_rows, key=lambda r: float(r["cost"]))
-    peak_hour = peak_row["hour"]
-    peak_cost = float(peak_row["cost"])
-
     avg_per_msg = f"{total_cost / total_msgs:.2f}" if total_msgs else "0.00"
-
-    # Collect all topics
-    all_topics = []
-    for r in day_rows:
-        topics = r.get("topics", "")
-        if topics:
-            all_topics.extend(topics.split(" | "))
-
-    # Deduplicate and take top 8
-    seen = set()
-    unique_topics = []
-    for t in all_topics:
-        if t not in seen and len(t) > 2:
-            seen.add(t)
-            unique_topics.append(t)
-
-    top_topics = " | ".join(unique_topics[:8])
 
     return {
         "date": today_str,
@@ -95,35 +93,119 @@ def aggregate_day(hourly_rows, today_str):
         "tokens_cached": str(total_cached),
         "cache_rate": cache_rate,
         "hours_active": str(hours_active),
-        "peak_hour": peak_hour,
-        "peak_hour_cost": f"{peak_cost:.2f}",
+        "peak_hour": peak_row["hour"],
+        "peak_hour_cost": f"{float(peak_row['cost']):.2f}",
         "avg_per_msg": avg_per_msg,
-        "top_topics": top_topics,
+        "summary": "",  # filled by GLM
     }
+
+
+def extract_user_messages(today_str):
+    """Extract user messages from archived daily log."""
+    archive_path = LOGS_ARCHIVE_DIR / f"{today_str}.log"
+    if not archive_path.exists():
+        return []
+
+    import re
+    turn_pat = re.compile(
+        r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}.*conversation turn:.*msg=['\"](.+?)['\"]"
+    )
+
+    messages = []
+    with open(archive_path) as f:
+        for line in f:
+            m = turn_pat.match(line)
+            if m:
+                msg = m.group(1)
+                # Filter system messages
+                if msg.startswith(("Review the conversation", "[System note:",
+                                   "[IMPORTANT:", "[CONTEXT COMPACT")):
+                    continue
+                # Clean voice messages
+                voice_m = re.match(r'\[The user sent a voice message.*?"(.+?)"', msg)
+                if voice_m:
+                    msg = f"🎤{voice_m.group(1)}"
+                ts = line[11:19]  # HH:MM:SS
+                messages.append(f"[{ts}] {msg[:80]}")
+
+    return messages
+
+
+def summarize_with_glm(today_str, user_messages, cost_data):
+    """Call GLM-5.1 once to generate a quality daily summary."""
+    api_key = get_api_key()
+    if not api_key:
+        return "（API key 未找到，跳过 AI 总结）"
+
+    # Build prompt
+    msg_list = "\n".join(user_messages[-30:])  # Last 30 messages
+    cost_summary = (
+        f"日期: {today_str}\n"
+        f"总费用: ¥{cost_data['total_cost']}\n"
+        f"消息数: {cost_data['messages']}\n"
+        f"活跃时段: {cost_data['hours_active']}小时\n"
+        f"峰值时段: {cost_data['peak_hour']}"
+    )
+
+    prompt = (
+        f"以下是 {today_str} 的对话记录和费用统计。请用 2-3 句话总结今天主要做了什么，"
+        f"重点标注重要成果和发现的问题。格式示例：\n"
+        f"「今天主要完成了XXX，期间发现了YYY问题，已通过ZZZ解决。」\n\n"
+        f"【费用统计】\n{cost_summary}\n\n"
+        f"【对话记录】\n{msg_list}"
+    )
+
+    # Call API
+    # Call API — GLM-5.1 is a reasoning model, need enough tokens for both
+    # reasoning (~1000) + actual output (~200). Use max_tokens=1500.
+    payload = {
+        "model": MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 1500,
+        "temperature": 0.3,
+    }
+
+    req = urllib.request.Request(
+        f"{API_BASE_URL}/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            return result["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        return f"（AI 总结失败: {str(e)[:50]}）"
 
 
 def format_report(today_str, day_summary, hourly_rows, recent_days):
     """Generate Telegram-friendly daily report."""
-    if not day_summary:
-        return None
-
     total_cost = float(day_summary["total_cost"])
     total_msgs = int(day_summary["messages"])
-    total_calls = int(day_summary["api_calls"])
-    total_in = int(day_summary["tokens_in"])
-    total_out = int(day_summary["tokens_out"])
     hours_active = int(day_summary["hours_active"])
     cache_rate = day_summary["cache_rate"]
 
     lines = []
     lines.append(f"📊 每日 Token 消耗报告 ({today_str})")
     lines.append("")
+
+    # AI Summary (the highlight!)
+    summary = day_summary.get("summary", "")
+    if summary:
+        lines.append(f"📝 AI 总结: {summary}")
+        lines.append("")
+
     lines.append(f"💰 总费用: ¥{total_cost:.2f}")
-    lines.append(f"💬 消息: {total_msgs} | 调用: {total_calls} | 活跃: {hours_active}h")
-    lines.append(f"📥 {total_in/1e6:.1f}M in | 📤 {total_out/1e3:.0f}K out | 💾 {cache_rate}% cached")
+    lines.append(f"💬 消息: {total_msgs} | 活跃: {hours_active}h")
+    lines.append(f"💾 缓存率: {cache_rate}%")
     lines.append("")
 
-    # Hourly breakdown with topics
+    # Hourly breakdown
     lines.append("逐小时:")
     day_rows = sorted(
         [r for r in hourly_rows if r.get("date") == today_str],
@@ -132,32 +214,15 @@ def format_report(today_str, day_summary, hourly_rows, recent_days):
     for r in day_rows:
         cost = float(r["cost"])
         msgs = int(r["messages"])
-        hour = r["hour"]
         models = r.get("models", "")
-        topics = r.get("topics", "")
-
         bar = "█" * min(int(cost / 2), 20)
-        topic_preview = ""
-        if topics:
-            # Show first topic only in the line
-            first_topic = topics.split(" | ")[0][:25]
-            topic_preview = f" 📝{first_topic}"
-
         lines.append(
-            f"  {hour} {msgs:>2}msg ¥{cost:>6.2f} {bar} {models}{topic_preview}"
+            f"  {r['hour']} {msgs:>2}msg ¥{cost:>6.2f} {bar} {models}"
         )
 
     if total_msgs:
         lines.append("")
         lines.append(f"📈 ¥{total_cost/total_msgs:.2f}/msg | ¥{total_cost/max(hours_active,1):.2f}/hr")
-
-    # Topics summary
-    all_topics = day_summary.get("top_topics", "")
-    if all_topics:
-        lines.append("")
-        lines.append("📝 今日话题:")
-        for t in all_topics.split(" | ")[:8]:
-            lines.append(f"  · {t}")
 
     # Historical trend
     if recent_days:
@@ -167,13 +232,11 @@ def format_report(today_str, day_summary, hourly_rows, recent_days):
             cost = float(row["total_cost"])
             msgs = int(row["messages"])
             bar = "█" * min(int(cost / 5), 15)
-            date = row["date"]
-            topics_preview = row.get("top_topics", "")
-            topic_hint = ""
-            if topics_preview:
-                first = topics_preview.split(" | ")[0][:15]
-                topic_hint = f" ({first})"
-            lines.append(f"  {date} ¥{cost:>7.2f} {msgs:>3}msg {bar}{topic_hint}")
+            summary_hint = ""
+            s = row.get("summary", "")
+            if s and len(s) > 5:
+                summary_hint = f" — {s[:30]}"
+            lines.append(f"  {row['date']} ¥{cost:>7.2f} {msgs:>3}msg {bar}{summary_hint}")
 
     return "\n".join(lines)
 
@@ -185,10 +248,20 @@ def main():
 
     today_str = datetime.now().strftime("%Y-%m-%d")
 
-    # Aggregate from hourly CSV
+    # Aggregate costs from hourly CSV
     day_summary = aggregate_day(hourly_rows, today_str)
     if not day_summary:
         sys.exit(0)
+
+    # Get user messages from archive
+    user_messages = extract_user_messages(today_str)
+
+    # Call GLM-5.1 for quality summary (~¥0.05)
+    if user_messages:
+        summary = summarize_with_glm(today_str, user_messages, day_summary)
+        day_summary["summary"] = summary
+    else:
+        day_summary["summary"] = "（无对话记录）"
 
     # Save to daily CSV (upsert)
     daily_rows = load_csv(DAILY_CSV)
@@ -202,10 +275,9 @@ def main():
         daily_rows.append(day_summary)
     save_csv(DAILY_CSV, daily_rows, DAILY_HEADERS)
 
-    # Generate report text
+    # Generate report
     recent = daily_rows[-7:] if len(daily_rows) >= 2 else []
     report = format_report(today_str, day_summary, hourly_rows, recent)
-
     if report:
         print(report)
 

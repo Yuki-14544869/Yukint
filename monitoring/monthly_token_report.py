@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Monthly token cost report — reads daily CSV, trend analysis with topics.
+"""Monthly token cost report — reads daily CSV with AI summaries.
 
 Designed for Hermes cron (no_agent=True). Runs on the 1st of each month.
 
-Data flow:
-  daily CSV → aggregate → monthly summary with trends + topic analysis
+Pipeline:
+  daily CSV (with summaries) → aggregate → monthly report with trends
 
-NO raw log parsing — everything comes from CSV files.
+NO API calls, NO log parsing — pure CSV aggregation.
 """
 
 import csv
@@ -21,7 +21,6 @@ DAILY_CSV = DATA_DIR / "daily_token_costs.csv"
 
 
 def load_csv(path):
-    """Load CSV rows as list of dicts."""
     if not path.exists():
         return []
     with open(path, "r", newline="") as f:
@@ -29,62 +28,45 @@ def load_csv(path):
 
 
 def filter_month(rows, year, month):
-    """Filter rows for a specific month."""
     prefix = f"{year}-{month:02d}"
     return [r for r in rows if r["date"].startswith(prefix)]
 
 
-def classify_topics(month_rows):
-    """Classify conversation topics into categories.
-
-    Groups similar topics together for monthly overview.
-    """
+def classify_from_summaries(month_rows):
+    """Classify topics from AI-generated daily summaries."""
     categories = {
-        "🔧 代码开发": ["代码", "脚本", "调试", "bug", "测试", "TDD", "commit", "pytest", "函数", "模块"],
-        "🤖 AI/LLM": ["token", "模型", "GLM", "API", "429", "限流", "用量", "费用", "播报"],
-        "📱 鸿蒙自动化": ["鸿蒙", "HDC", "签到", "手机", "华为", "hmdriver"],
+        "🔧 代码开发": ["代码", "脚本", "调试", "bug", "测试", "TDD", "commit", "pytest", "函数", "修复", "重构"],
+        "🤖 AI/LLM": ["token", "模型", "GLM", "API", "429", "限流", "用量", "费用", "播报", "缓存"],
+        "📱 鸿蒙自动化": ["鸿蒙", "HDC", "签到", "手机", "华为", "hmdriver", "HarmonyOS"],
         "🎮 游戏": ["崩3", "原神", "崩铁", "深渊", "乐土", "战场", "忘却", "虚构"],
-        "⚙️ 系统配置": ["配置", "cron", "Hermes", "Telegram", "安装", "迁移"],
+        "⚙️ 系统配置": ["配置", "cron", "Hermes", "Telegram", "安装", "迁移", "GitHub", "插件"],
         "💬 日常对话": [],
     }
 
-    all_topics = []
-    for r in month_rows:
-        topics = r.get("top_topics", "")
-        if topics:
-            all_topics.extend(topics.split(" | "))
-
-    # Classify each topic
     cat_counts = Counter()
-    unclassified = []
-
-    for topic in all_topics:
-        if len(topic) < 3:
+    for r in month_rows:
+        summary = r.get("summary", "")
+        if not summary or summary.startswith("（"):
+            cat_counts["💬 日常对话"] += 1
             continue
         classified = False
         for cat, keywords in categories.items():
             if cat == "💬 日常对话":
                 continue
-            if any(kw in topic for kw in keywords):
+            if any(kw in summary for kw in keywords):
                 cat_counts[cat] += 1
                 classified = True
                 break
         if not classified:
-            unclassified.append(topic)
-
-    # Add unclassified as "日常对话"
-    if unclassified:
-        cat_counts["💬 日常对话"] = len(unclassified)
+            cat_counts["💬 日常对话"] += 1
 
     return cat_counts
 
 
 def format_monthly_report(year, month, month_rows, all_rows):
-    """Generate the Telegram-friendly monthly report."""
     if not month_rows:
         return f"📊 {year}年{month}月 Token 消耗月报\n\n暂无数据"
 
-    # Month totals
     total_cost = sum(float(r["total_cost"]) for r in month_rows)
     total_msgs = sum(int(r["messages"]) for r in month_rows)
     total_calls = sum(int(r["api_calls"]) for r in month_rows)
@@ -100,10 +82,10 @@ def format_monthly_report(year, month, month_rows, all_rows):
     lines.append(f"📅 活跃天数: {days_active} 天")
     lines.append(f"💬 总消息: {total_msgs} | 调用: {total_calls}")
     lines.append(f"📥 {total_in/1e6:.1f}M in | 📤 {total_out/1e6:.1f}M out")
-    lines.append(f"📈 日均: ¥{avg_daily:.2f} | ¥{total_cost/total_msgs:.2f}/msg" if total_msgs else "")
+    lines.append(f"📈 日均: ¥{avg_daily:.2f}" + (f" | ¥{total_cost/total_msgs:.2f}/msg" if total_msgs else ""))
 
-    # Topic analysis
-    cat_counts = classify_topics(month_rows)
+    # Topic classification from summaries
+    cat_counts = classify_from_summaries(month_rows)
     if cat_counts:
         lines.append("")
         lines.append("📂 话题分布:")
@@ -111,22 +93,19 @@ def format_monthly_report(year, month, month_rows, all_rows):
         for cat, count in cat_counts.most_common():
             pct = count / total_topics * 100
             bar = "█" * min(int(pct / 5), 15)
-            lines.append(f"  {cat} {count}次 {pct:.0f}% {bar}")
+            lines.append(f"  {cat} {count}天 {pct:.0f}% {bar}")
 
-    # Daily breakdown
+    # Daily breakdown WITH summaries
     lines.append("")
-    lines.append("每日消耗:")
+    lines.append("每日明细:")
     for r in month_rows:
         cost = float(r["total_cost"])
         msgs = int(r["messages"])
         peak = r.get("peak_hour", "")
         bar = "█" * min(int(cost / 3), 25)
-        topic_hint = ""
-        topics = r.get("top_topics", "")
-        if topics:
-            first = topics.split(" | ")[0][:20]
-            topic_hint = f" ({first})"
-        lines.append(f"  {r['date']} ¥{cost:>7.2f} {msgs:>3}msg {bar} {peak}{topic_hint}")
+        summary = r.get("summary", "")
+        summary_hint = f" — {summary[:40]}" if summary and not summary.startswith("（") else ""
+        lines.append(f"  {r['date']} ¥{cost:>7.2f} {msgs:>3}msg {bar}{summary_hint}")
 
     # Weekly trend
     lines.append("")
@@ -139,15 +118,12 @@ def format_monthly_report(year, month, month_rows, all_rows):
         end = week[-1]["date"][-5:]
         bar = "█" * min(int(week_cost / 10), 20)
 
-        # Collect week topics
-        week_topics = []
-        for r in week:
-            t = r.get("top_topics", "")
-            if t:
-                week_topics.extend(t.split(" | ")[:2])
-        topic_sample = week_topics[0][:20] if week_topics else ""
+        # Pick best summary from the week
+        week_summaries = [r.get("summary", "") for r in week
+                         if r.get("summary", "") and not r["summary"].startswith("（")]
+        best = week_summaries[0][:30] if week_summaries else ""
 
-        lines.append(f"  {start}~{end} ¥{week_cost:>7.2f} {week_msgs:>3}msg {bar} {topic_sample}")
+        lines.append(f"  {start}~{end} ¥{week_cost:>7.2f} {week_msgs:>3}msg {bar} {best}")
 
     # Comparison with previous month
     if len(all_rows) > days_active:
@@ -166,7 +142,7 @@ def format_monthly_report(year, month, month_rows, all_rows):
             lines.append(f"  日均费用: ¥{avg_daily:.2f} vs ¥{prev_avg:.2f} {emoji}{abs(cost_diff):.0f}%")
             lines.append(f"  日均消息: {total_msgs/days_active:.0f} vs {prev_msgs/len(prev_rows):.0f}")
 
-    # Top 3 most expensive days
+    # Top 3 most expensive days with summaries
     sorted_days = sorted(month_rows, key=lambda r: float(r["total_cost"]), reverse=True)
     lines.append("")
     lines.append("🔥 最贵3天:")
@@ -174,11 +150,9 @@ def format_monthly_report(year, month, month_rows, all_rows):
         cost = float(r["total_cost"])
         msgs = int(r["messages"])
         peak = r.get("peak_hour", "??:00")
-        topic = ""
-        topics = r.get("top_topics", "")
-        if topics:
-            topic = f" — {topics.split(' | ')[0][:25]}"
-        lines.append(f"  {r['date']} ¥{cost:.2f} ({msgs}msg, 峰值{peak}){topic}")
+        summary = r.get("summary", "")
+        s = f" — {summary[:50]}" if summary and not summary.startswith("（") else ""
+        lines.append(f"  {r['date']} ¥{cost:.2f} ({msgs}msg, 峰值{peak}){s}")
 
     # Insights
     lines.append("")
@@ -190,7 +164,7 @@ def format_monthly_report(year, month, month_rows, all_rows):
 
     top_cat = cat_counts.most_common(1)
     if top_cat:
-        lines.append(f"  📌 主要精力花在: {top_cat[0][0]}（{top_cat[0][1]}次相关操作）")
+        lines.append(f"  📌 主要精力: {top_cat[0][0]}（{top_cat[0][1]}天）")
 
     return "\n".join(lines)
 
@@ -200,14 +174,12 @@ def main():
     if not all_rows:
         sys.exit(0)
 
-    # Report for previous month (runs on the 1st)
     prev = datetime.now() - timedelta(days=1)
     year = prev.year
     month = prev.month
 
     month_rows = filter_month(all_rows, year, month)
     report = format_monthly_report(year, month, month_rows, all_rows)
-
     print(report)
 
 
