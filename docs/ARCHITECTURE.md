@@ -28,13 +28,20 @@
 │           │                       │                      │
 │           ▼                       ▼                      │
 │  ┌─────────────────────────────────┐                    │
-│  │ daily_token_report.py           │  ← 每天12:00      │
-│  │                                 │    (~¥0.04)        │
+│  │ daily_token_report.py (v2)      │  ← 每天12:00      │
+│  │                                 │    (~¥0.08)        │
 │  │  1. 从 hourly CSV 汇总费用      │                    │
 │  │  2. 从日志归档提取对话          │                    │
-│  │  3. 调用 GLM-5.1 生成总结      │                    │
-│  │  4. 写 daily CSV               │                    │
-│  │  5. 输出日报 → TG              │                    │
+│  │  3. extract_user_messages_by_   │                    │
+│  │     hour() → 按小时分组消息     │                    │
+│  │  4. generate_all_summaries()    │                    │
+│  │     ├ Call 1: GLM-5.1 全天总结 │                    │
+│  │     └ Call 2: GLM-5.1 逐小时   │                    │
+│  │       总结+爱莉希雅评语         │                    │
+│  │  5. format_report() 含逐小时   │                    │
+│  │     活动+🌸评语                 │                    │
+│  │  6. 写 daily CSV               │                    │
+│  │  7. 输出日报 → TG              │                    │
 │  └──────────────┬──────────────────┘                    │
 │                 │                                        │
 │                 ▼                                        │
@@ -98,20 +105,82 @@ ALL_LOG_PATHS = [LOG_PATH] + sorted(glob("agent.log.[0-9]*"))
 - 有匹配 → True → 继续执行
 - 无匹配 → False → `sys.exit(0)` 静默退出
 
-### 2.3 daily_token_report.py（日报 + AI 总结）
+### 2.3 daily_token_report.py（日报 v2 — 两次 GLM-5.1 调用）
 
-**职责：** 从 CSV 聚合当日数据，调用 GLM-5.1 生成高质量总结。
+**职责：** 从 CSV 聚合当日数据，调用 GLM-5.1 生成全天总结、逐小时活动总结和爱莉希雅评语。
+
+**v2 架构变化（相比 v1）：**
+
+v1 使用 1 次 GLM 调用生成简单总结。v2 改为 2 次 GLM-5.1 调用，分别处理不同任务：
+
+- **Call 1：全天总结** — 更好的推理质量，生成 2-3 句精炼概述
+- **Call 2：逐小时总结 + 爱莉希雅评语** — 结构化输出，同时生成事实性活动概括和角色化评语
+
+**新增/变更函数：**
+
+| 函数 | 状态 | 说明 |
+|------|------|------|
+| `extract_user_messages_by_hour()` | **新增** | 从归档日志按小时分组提取用户消息，返回 `{"HH:00": ["[HH:MM:SS] msg", ...]}` |
+| `generate_all_summaries()` | **新增** | 编排两次 GLM-5.1 调用，返回 `(daily_summary, hourly_summaries, daily_comment, hourly_comments)` |
+| `format_report()` | **变更** | 新增 `hourly_summaries`, `daily_comment`, `hourly_comments` 参数，逐小时行后追加 `↳ 活动概括` 和 `🌸 爱莉希雅评语` |
+| `summarize_with_glm()` | 保留（v1兼容） | 单次调用接口，仍可用于简单场景 |
+
+**两次 GLM-5.1 调用详情：**
+
+```
+generate_all_summaries(today_str, hourly_msgs, hourly_rows, cost_data)
+    │
+    ├─ Call 1: 全天总结
+    │   ├─ model: glm-5.1
+    │   ├─ max_tokens: 2000
+    │   ├─ temperature: 0.3
+    │   ├─ prompt: 逐小时对话记录 → 2-3句精炼总结
+    │   └─ 输出: daily_summary (str)
+    │
+    └─ Call 2: 逐小时 + 评语
+        ├─ model: glm-5.1
+        ├─ max_tokens: 4000 (reasoning ~1000-2000 + output ~1500)
+        ├─ temperature: 0.5 (更高 = 更有个性)
+        ├─ prompt: 逐小时记录 → 任务1: 活动概括 + 任务2: 爱莉希雅评语
+        └─ 输出: hourly_summaries (dict) + daily_comment (str) + hourly_comments (dict)
+```
 
 **GLM-5.1 调用要点：**
 - 端点：`https://open.bigmodel.cn/api/coding/paas/v4/chat/completions`
 - GLM-5.1 是**推理模型**：`reasoning_content` 占 output token 额度
-- `max_tokens` 必须设 1500+（reasoning ~1000 + output ~200）
+- `max_tokens` 必须设 4000+（reasoning ~1000-2000 + output ~1500）
 - API key 存储在 `~/.hermes/auth.json` → `credential_pool.zai[0].access_token`
-- 超时设 60 秒（推理模型响应较慢）
+- 超时设 120 秒（推理模型 + 长 prompt 响应较慢）
 
-**费用估算：**
-- Prompt ~500 tokens + Reasoning ~1000 + Output ~200 ≈ 1700 tokens
-- 成本 ≈ ¥0.036/次
+**5.1 Markdown 兼容性：**
+
+GLM-5.1 输出常含 markdown 格式（`**bold**`、`-` 列表等），解析器需做兼容处理：
+```python
+# 去 **bold** 标记
+content_clean = re.sub(r'\*\*', '', content)
+# 去 • / - 列表前缀
+content_clean = re.sub(r'^[•\-]\s*', '', content_clean, flags=re.MULTILINE)
+```
+
+解析规则兼容多种格式变体：
+- `HH:MM 概括` / `HH:MM: 概括`（有无冒号）
+- `DAY: 评语`（全天评语标记）
+- `HH:MM* 评语`（`*` 后缀标记爱莉希雅评语）
+- 自动跳过 section headers（任务1、概括、评语等非数据行）
+
+**费用估算（v2）：**
+- Call 1: Prompt ~500 + Reasoning ~800 + Output ~200 ≈ 1500 tokens
+- Call 2: Prompt ~800 + Reasoning ~1500 + Output ~1200 ≈ 3500 tokens
+- 总计 ≈ ¥0.08/天
+
+**extract_user_messages_by_hour() 与 v1 的区别：**
+
+| 特性 | v1 `extract_user_messages()` | v2 `extract_user_messages_by_hour()` |
+|------|------|------|
+| 返回类型 | `list[str]` | `dict[str, list[str]]` |
+| 分组方式 | 平铺列表 | 按 `HH:00` 分组 |
+| 系统过滤 | 基础4种 | +`⏳ Still working` |
+| 消息截断 | 80 字符 | 100 字符 |
 
 ### 2.4 monthly_token_report.py（月报）
 
@@ -165,13 +234,18 @@ Hermes 原始日志的子集，只保留：
 | 决策 | 理由 |
 |------|------|
 | 只在每小时解析日志 | 避免重复解析，日报/月报纯从 CSV 读取 |
-| 每天只调一次 GLM-5.1 | 平衡质量与成本（¥0.04/天 vs ¥0.72/天每小时总结） |
+| 每天 2 次 GLM-5.1 调用 | v1 只调1次生成简单总结；v2 拆分为全天总结+逐小时+评语，兼顾推理质量和角色化输出 |
 | 日志归档独立存储 | Hermes 日志会轮转丢失，归档是永久记录 |
 | no_agent 模式 | 所有 cron 脚本零 token 消耗（除日报 GLM 调用） |
 | 去重用 (timestamp, msg) | 同一秒可能有不同对话，不能只按时间戳去重 |
+| max_tokens=4000 | 5.1 推理链消耗 ~1000-2000 tokens，必须留足够空间给实际输出 |
+| 解析器去 markdown | 5.1 输出含 `**bold**`、`-` 列表等，需正则清理后再解析结构 |
+| 去除 cost 过滤 | v2 展示所有有用户消息的小时（v1 只展示有费用的小时） |
 
 ## 5. 已知限制
 
 - 话题分类依赖硬编码关键词，新话题需要手动更新
 - GLM-5.1 推理模型偶尔会因 `max_tokens` 不够只输出 reasoning 不输出 content
 - 日志归档不包含 AI 回复内容（只有用户消息和 API 统计）
+- 5.1 markdown 输出格式不稳定，解析器需持续兼容新变体
+- 逐小时评语依赖 5.1 严格遵循 `HH:MM*` 格式，偶尔解析失败
