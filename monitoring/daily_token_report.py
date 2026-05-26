@@ -1,24 +1,19 @@
 #!/usr/bin/env python3
-"""Daily token cost report — reads hourly CSV + raw logs for daily summary.
+"""Daily token cost report — reads hourly CSV, zero log parsing.
 
-Designed for Hermes cron (no_agent=True). Runs once daily at 12:00.
+Designed for Hermes cron (no_agent=True). Runs daily at 12:00.
 
-Reads from:
-  - hourly CSV (hourly_token_costs.csv) for trend data
-  - raw logs for full-day accuracy (handles re-computation)
+Data flow:
+  hourly CSV → aggregate → daily summary text → daily CSV row
 
-Outputs:
-  - Telegram-friendly text report with hourly breakdown
-  - Updates daily_token_costs.csv (one row per day)
+NO raw log parsing — everything comes from the hourly CSV
+that token_report_cron.py already wrote.
 """
 
 import csv
 import sys
 from datetime import datetime
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent))
-import token_cost_report as rpt
 
 DATA_DIR = Path.home() / ".hermes" / "data"
 HOURLY_CSV = DATA_DIR / "hourly_token_costs.csv"
@@ -27,56 +22,12 @@ DAILY_CSV = DATA_DIR / "daily_token_costs.csv"
 DAILY_HEADERS = [
     "date", "total_cost", "messages", "api_calls",
     "tokens_in", "tokens_out", "tokens_cached", "cache_rate",
-    "rate_limit_429", "compressions",
-    "avg_per_msg", "peak_hour", "peak_hour_cost", "hours_active",
+    "hours_active", "peak_hour", "peak_hour_cost",
+    "avg_per_msg", "top_topics",
 ]
 
 
-def compute_hourly(turns):
-    """Group turns by hour, compute per-hour stats."""
-    hours = {}
-    for t in turns:
-        h_key = t["time"].strftime("%H:00")
-        if h_key not in hours:
-            hours[h_key] = {
-                "msgs": 0, "calls": 0, "cost": 0.0,
-                "ti": 0, "to": 0, "tc": 0, "models": {},
-            }
-        hours[h_key]["msgs"] += 1
-        stats = rpt.compute_turn(t)
-        hours[h_key]["calls"] += stats["calls"]
-        hours[h_key]["cost"] += stats["cost"]
-        hours[h_key]["ti"] += stats["input"]
-        hours[h_key]["to"] += stats["output"]
-        hours[h_key]["tc"] += stats["cached"]
-        for c in t["api_calls"]:
-            short = ("5.1" if "5.1" in c["model"]
-                     else "4.7" if "4.7" in c["model"]
-                     else c["model"])
-            hours[h_key]["models"][short] = (
-                hours[h_key]["models"].get(short, 0) + 1
-            )
-    return hours
-
-
-def count_events():
-    """Count 429s and compressions across all rotated logs."""
-    four29 = compressions = 0
-    for log_file in rpt.ALL_LOG_PATHS:
-        if not log_file.exists():
-            continue
-        with open(log_file) as f:
-            for line in f:
-                if not line.startswith(rpt.TODAY_STR):
-                    continue
-                if "1305" in line or "访问量过大" in line:
-                    four29 += 1
-                if "compression done" in line:
-                    compressions += 1
-    return four29, compressions
-
-
-def load_csv(path, headers):
+def load_csv(path):
     """Load CSV rows as list of dicts."""
     if not path.exists():
         return []
@@ -93,47 +44,120 @@ def save_csv(path, rows, headers):
         writer.writerows(rows)
 
 
-def load_recent_days(n=7):
-    """Load last N days from daily CSV."""
-    rows = load_csv(DAILY_CSV, DAILY_HEADERS)
-    return rows[-n:] if rows else []
+def aggregate_day(hourly_rows, today_str):
+    """Aggregate hourly rows into a daily summary."""
+    day_rows = [r for r in hourly_rows if r.get("date") == today_str]
+
+    if not day_rows:
+        return None
+
+    total_cost = sum(float(r["cost"]) for r in day_rows)
+    total_msgs = sum(int(r["messages"]) for r in day_rows)
+    total_calls = sum(int(r["api_calls"]) for r in day_rows)
+    total_in = sum(int(r["tokens_in"]) for r in day_rows)
+    total_out = sum(int(r["tokens_out"]) for r in day_rows)
+    total_cached = sum(int(r["tokens_cached"]) for r in day_rows)
+    hours_active = len(day_rows)
+
+    cache_rate = f"{total_cached / total_in * 100:.0f}" if total_in else "0"
+
+    # Find peak hour
+    peak_row = max(day_rows, key=lambda r: float(r["cost"]))
+    peak_hour = peak_row["hour"]
+    peak_cost = float(peak_row["cost"])
+
+    avg_per_msg = f"{total_cost / total_msgs:.2f}" if total_msgs else "0.00"
+
+    # Collect all topics
+    all_topics = []
+    for r in day_rows:
+        topics = r.get("topics", "")
+        if topics:
+            all_topics.extend(topics.split(" | "))
+
+    # Deduplicate and take top 8
+    seen = set()
+    unique_topics = []
+    for t in all_topics:
+        if t not in seen and len(t) > 2:
+            seen.add(t)
+            unique_topics.append(t)
+
+    top_topics = " | ".join(unique_topics[:8])
+
+    return {
+        "date": today_str,
+        "total_cost": f"{total_cost:.2f}",
+        "messages": str(total_msgs),
+        "api_calls": str(total_calls),
+        "tokens_in": str(total_in),
+        "tokens_out": str(total_out),
+        "tokens_cached": str(total_cached),
+        "cache_rate": cache_rate,
+        "hours_active": str(hours_active),
+        "peak_hour": peak_hour,
+        "peak_hour_cost": f"{peak_cost:.2f}",
+        "avg_per_msg": avg_per_msg,
+        "top_topics": top_topics,
+    }
 
 
-def format_text_report(today_str, hours, totals, four29, compressions, recent_days):
-    """Generate the Telegram-friendly text report."""
-    total_cost = totals["cost"]
-    total_msgs = totals["msgs"]
-    total_calls = totals["calls"]
-    total_in = totals["ti"]
-    total_out = totals["to"]
-    total_cache = totals["tc"]
-    cache_rate = total_cache / total_in * 100 if total_in else 0
+def format_report(today_str, day_summary, hourly_rows, recent_days):
+    """Generate Telegram-friendly daily report."""
+    if not day_summary:
+        return None
+
+    total_cost = float(day_summary["total_cost"])
+    total_msgs = int(day_summary["messages"])
+    total_calls = int(day_summary["api_calls"])
+    total_in = int(day_summary["tokens_in"])
+    total_out = int(day_summary["tokens_out"])
+    hours_active = int(day_summary["hours_active"])
+    cache_rate = day_summary["cache_rate"]
 
     lines = []
     lines.append(f"📊 每日 Token 消耗报告 ({today_str})")
     lines.append("")
     lines.append(f"💰 总费用: ¥{total_cost:.2f}")
-    lines.append(f"💬 消息: {total_msgs} | 调用: {total_calls} | 429: {four29}")
-    lines.append(f"📥 {total_in/1e6:.1f}M in | 📤 {total_out/1e3:.0f}K out | 💾 {cache_rate:.0f}% cached")
+    lines.append(f"💬 消息: {total_msgs} | 调用: {total_calls} | 活跃: {hours_active}h")
+    lines.append(f"📥 {total_in/1e6:.1f}M in | 📤 {total_out/1e3:.0f}K out | 💾 {cache_rate}% cached")
     lines.append("")
-    lines.append("逐小时:")
 
-    for h in sorted(hours.keys()):
-        d = hours[h]
-        if d["msgs"] == 0:
-            continue
-        cr = d["tc"] / d["ti"] * 100 if d["ti"] else 0
-        ms = "+".join(f"{m}×{c}" for m, c in sorted(d["models"].items()))
-        bar = "█" * min(int(d["cost"] / 2), 20)
+    # Hourly breakdown with topics
+    lines.append("逐小时:")
+    day_rows = sorted(
+        [r for r in hourly_rows if r.get("date") == today_str],
+        key=lambda r: r["hour"],
+    )
+    for r in day_rows:
+        cost = float(r["cost"])
+        msgs = int(r["messages"])
+        hour = r["hour"]
+        models = r.get("models", "")
+        topics = r.get("topics", "")
+
+        bar = "█" * min(int(cost / 2), 20)
+        topic_preview = ""
+        if topics:
+            # Show first topic only in the line
+            first_topic = topics.split(" | ")[0][:25]
+            topic_preview = f" 📝{first_topic}"
+
         lines.append(
-            f"  {h} {d['msgs']:>2}msg {d['calls']:>3}api "
-            f"¥{d['cost']:>6.2f} {bar} {ms}"
+            f"  {hour} {msgs:>2}msg ¥{cost:>6.2f} {bar} {models}{topic_preview}"
         )
 
     if total_msgs:
-        hours_active = sum(1 for h in hours.values() if h["msgs"] > 0)
         lines.append("")
-        lines.append(f"📈 ¥{total_cost/total_msgs:.2f}/msg | ¥{total_cost/max(hours_active, 1):.2f}/hr | {hours_active}h 活跃")
+        lines.append(f"📈 ¥{total_cost/total_msgs:.2f}/msg | ¥{total_cost/max(hours_active,1):.2f}/hr")
+
+    # Topics summary
+    all_topics = day_summary.get("top_topics", "")
+    if all_topics:
+        lines.append("")
+        lines.append("📝 今日话题:")
+        for t in all_topics.split(" | ")[:8]:
+            lines.append(f"  · {t}")
 
     # Historical trend
     if recent_days:
@@ -143,73 +167,47 @@ def format_text_report(today_str, hours, totals, four29, compressions, recent_da
             cost = float(row["total_cost"])
             msgs = int(row["messages"])
             bar = "█" * min(int(cost / 5), 15)
-            lines.append(f"  {row['date']} ¥{cost:>7.2f} {msgs:>3}msg {bar}")
+            date = row["date"]
+            topics_preview = row.get("top_topics", "")
+            topic_hint = ""
+            if topics_preview:
+                first = topics_preview.split(" | ")[0][:15]
+                topic_hint = f" ({first})"
+            lines.append(f"  {date} ¥{cost:>7.2f} {msgs:>3}msg {bar}{topic_hint}")
 
     return "\n".join(lines)
 
 
 def main():
-    turns = rpt.parse_logs()
-    if not turns:
+    hourly_rows = load_csv(HOURLY_CSV)
+    if not hourly_rows:
         sys.exit(0)
 
-    hours = compute_hourly(turns)
-    four29, compressions = count_events()
+    today_str = datetime.now().strftime("%Y-%m-%d")
 
-    totals = {
-        "msgs": sum(h["msgs"] for h in hours.values()),
-        "calls": sum(h["calls"] for h in hours.values()),
-        "cost": sum(h["cost"] for h in hours.values()),
-        "ti": sum(h["ti"] for h in hours.values()),
-        "to": sum(h["to"] for h in hours.values()),
-        "tc": sum(h["tc"] for h in hours.values()),
-    }
-
-    today_str = rpt.TODAY_STR
-
-    # Find peak hour
-    peak_hour = ""
-    peak_cost = 0.0
-    hours_active = 0
-    for h, d in hours.items():
-        if d["cost"] > peak_cost:
-            peak_cost = d["cost"]
-            peak_hour = h
-        if d["msgs"] > 0:
-            hours_active += 1
+    # Aggregate from hourly CSV
+    day_summary = aggregate_day(hourly_rows, today_str)
+    if not day_summary:
+        sys.exit(0)
 
     # Save to daily CSV (upsert)
-    new_row = {
-        "date": today_str,
-        "total_cost": f"{totals['cost']:.2f}",
-        "messages": str(totals["msgs"]),
-        "api_calls": str(totals["calls"]),
-        "tokens_in": str(totals["ti"]),
-        "tokens_out": str(totals["to"]),
-        "tokens_cached": str(totals["tc"]),
-        "cache_rate": f"{totals['tc']/totals['ti']*100:.0f}" if totals["ti"] else "0",
-        "rate_limit_429": str(four29),
-        "compressions": str(compressions),
-        "avg_per_msg": f"{totals['cost']/totals['msgs']:.2f}" if totals["msgs"] else "0.00",
-        "peak_hour": peak_hour,
-        "peak_hour_cost": f"{peak_cost:.2f}",
-        "hours_active": str(hours_active),
-    }
-
-    rows = load_csv(DAILY_CSV, DAILY_HEADERS)
+    daily_rows = load_csv(DAILY_CSV)
     updated = False
-    for i, row in enumerate(rows):
+    for i, row in enumerate(daily_rows):
         if row["date"] == today_str:
-            rows[i] = new_row
+            daily_rows[i] = day_summary
             updated = True
             break
     if not updated:
-        rows.append(new_row)
-    save_csv(DAILY_CSV, rows, DAILY_HEADERS)
+        daily_rows.append(day_summary)
+    save_csv(DAILY_CSV, daily_rows, DAILY_HEADERS)
 
-    # Print report with recent trend
-    recent = load_recent_days(7)
-    print(format_text_report(today_str, hours, totals, four29, compressions, recent))
+    # Generate report text
+    recent = daily_rows[-7:] if len(daily_rows) >= 2 else []
+    report = format_report(today_str, day_summary, hourly_rows, recent)
+
+    if report:
+        print(report)
 
 
 if __name__ == "__main__":
