@@ -1,0 +1,2 @@
+date,total_cost,messages,api_calls,tokens_in,tokens_out,tokens_cached,cache_rate,rate_limit_429,compressions,avg_per_msg,peak_hour,peak_hour_cost
+2026-05-26,135.89,102,1018,76709275,241346,73324480,96,69,13,1.33,03:00,37.48

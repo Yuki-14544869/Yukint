@@ -24,6 +24,14 @@ NOW = datetime.now()
 TODAY_STR = NOW.strftime("%Y-%m-%d")
 HOUR_AGO = NOW - timedelta(hours=1)
 
+# Log rotation: Hermes rotates agent.log → agent.log.1 when file gets large.
+# Must read both to get full day's data.
+LOG_DIR = LOG_PATH.parent
+ALL_LOG_PATHS = [LOG_PATH] + sorted(
+    [p for p in LOG_DIR.glob("agent.log.[0-9]*")],
+    key=lambda p: p.suffix,
+)
+
 
 def get_pricing(model):
     if "4.7" in model or "4.5" in model:
@@ -48,13 +56,22 @@ def truncate_msg(msg, max_len=35):
 
 
 def parse_logs():
-    if not LOG_PATH.exists():
-        return []
+    """Parse conversation turns from agent.log (and rotated agent.log.N).
 
-    with open(LOG_PATH, "r") as f:
-        lines = f.readlines()
+    Reads ALL log files to handle log rotation. Deduplicates by timestamp
+    since agent.log.1 tail and agent.log head may overlap.
+    """
+    all_lines = []
+    for log_file in ALL_LOG_PATHS:
+        if not log_file.exists():
+            continue
+        with open(log_file, "r") as f:
+            all_lines.extend(f.readlines())
 
-    today_lines = [l for l in lines if l.startswith(TODAY_STR)]
+    today_lines = [l for l in all_lines if l.startswith(TODAY_STR)]
+    # Note: do NOT sort today_lines. Lines within each log file are already
+    # chronological, and we read rotated logs first (older) then current (newer).
+    # Sorting would break stateful parsing (API call lines must follow their turn).
 
     turn_pat = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*conversation turn:.*msg=\'(.*?)\'\s*$')
     turn_pat2 = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*conversation turn:.*msg="(.*?)"\s*$')
@@ -89,7 +106,17 @@ def parse_logs():
         if m and current_turn:
             current_turn["response_len"] = int(m.group(2))
 
-    return turns
+    # Deduplicate: rotated log tail and current log head may overlap.
+    # Use (timestamp, msg) as key to avoid collapsing distinct turns at the same second.
+    seen = set()
+    deduped = []
+    for t in turns:
+        key = (t["time"].strftime("%Y-%m-%d %H:%M:%S"), t["msg"][:50])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(t)
+
+    return deduped
 
 
 def compute_turn(turn):
@@ -196,9 +223,20 @@ def main():
     hourly_rows, h_msgs, h_calls, h_cost = build_table(turns, start_time=HOUR_AGO, end_time=NOW, title="过去1小时")
     daily_rows, d_msgs, d_calls, d_cost = build_table(turns, start_time=None, end_time=NOW, title="今日")
 
-    # Count 429s today
-    four29 = sum(1 for l in open(LOG_PATH) if l.startswith(TODAY_STR) and ("1305" in l or "访问量过大" in l))
-    compressions = sum(1 for l in open(LOG_PATH) if l.startswith(TODAY_STR) and "compression done" in l)
+    # Count 429s and compressions today (across all rotated logs)
+    four29 = 0
+    compressions = 0
+    for log_file in ALL_LOG_PATHS:
+        if not log_file.exists():
+            continue
+        with open(log_file) as f:
+            for line in f:
+                if not line.startswith(TODAY_STR):
+                    continue
+                if "1305" in line or "访问量过大" in line:
+                    four29 += 1
+                if "compression done" in line:
+                    compressions += 1
 
     now_str = NOW.strftime("%Y-%m-%d %H:%M")
 

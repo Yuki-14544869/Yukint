@@ -127,17 +127,22 @@ class TestParseLogs:
         tmp.close()
         return Path(tmp.name)
 
+    def _patch_logs(self, log_path: Path):
+        """Patch both LOG_PATH and ALL_LOG_PATHS to use temp file only."""
+        return patch.object(rpt, "ALL_LOG_PATHS", [log_path])
+
     def test_pl001_empty_log_returns_empty(self):
         """PL-001: empty log file → empty list."""
         log = self._make_log("")
-        with patch.object(rpt, "LOG_PATH", log):
+        with self._patch_logs(log):
             result = rpt.parse_logs()
         os.unlink(log)
         assert result == []
 
     def test_pl002_nonexistent_log_returns_empty(self):
         """PL-002: nonexistent path → empty list."""
-        with patch.object(rpt, "LOG_PATH", Path("/tmp/nonexistent_test_log_9999.log")):
+        fake = Path("/tmp/nonexistent_test_log_9999.log")
+        with self._patch_logs(fake):
             result = rpt.parse_logs()
         assert result == []
 
@@ -153,7 +158,7 @@ class TestParseLogs:
             f'{ts3} INFO Turn ended: response_len=1234\n'
         )
         log = self._make_log(content)
-        with patch.object(rpt, "LOG_PATH", log):
+        with self._patch_logs(log):
             turns = rpt.parse_logs()
         os.unlink(log)
 
@@ -176,7 +181,7 @@ class TestParseLogs:
             f"{ts} INFO conversation turn: msg='normal message'\n"
         )
         log = self._make_log(content)
-        with patch.object(rpt, "LOG_PATH", log):
+        with self._patch_logs(log):
             turns = rpt.parse_logs()
         os.unlink(log)
 
@@ -189,7 +194,7 @@ class TestParseLogs:
         ts = f"{today} 10:00:00"
         content = f'{ts} INFO conversation turn: msg="double quoted"\n'
         log = self._make_log(content)
-        with patch.object(rpt, "LOG_PATH", log):
+        with self._patch_logs(log):
             turns = rpt.parse_logs()
         os.unlink(log)
 
@@ -206,7 +211,7 @@ class TestParseLogs:
             f"{ts} INFO API call #2: model=glm-4.7 in=1000 out=100 cache=200/1000\n"
         )
         log = self._make_log(content)
-        with patch.object(rpt, "LOG_PATH", log):
+        with self._patch_logs(log):
             turns = rpt.parse_logs()
         os.unlink(log)
 
